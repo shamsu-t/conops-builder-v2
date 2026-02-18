@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Dict
 from datetime import datetime
 from sqlmodel import SQLModel, Field as SQLField, create_engine, Session, select
@@ -31,11 +31,47 @@ engine = create_engine(f"sqlite:///{DB_PATH}")
 class Phase(BaseModel):
     name: str
     order: int
+    duration: float = Field(default=1, gt=0)
+
+class Window(BaseModel):
+    name: str
+    start: float
+    end: float
+
+    @model_validator(mode='after')
+    def validate_range(self):
+        if self.end <= self.start:
+            raise ValueError('window.end must be > window.start')
+        return self
+
+class WindowMask(BaseModel):
+    name: str
+    start: float
+    end: float
+    mode: str = 'allow'  # allow | deny
+
+    @model_validator(mode='after')
+    def validate_mask(self):
+        if self.end <= self.start:
+            raise ValueError('window_mask.end must be > window_mask.start')
+        if self.mode not in {'allow', 'deny'}:
+            raise ValueError("window_mask.mode must be 'allow' or 'deny'")
+        return self
+
+class Activity(BaseModel):
+    name: str
+    start: float
+    duration: float = Field(default=1, gt=0)
+    row: int = 0
 
 class ConOpsInput(BaseModel):
     intent: str
     stakeholders: str
     phases: List[Phase]
+    windows: List[Window] = []
+    window_masks: List[WindowMask] = []
+    activities: List[Activity] = []
+    timeline_rows: List[str] = []
     template: str = 'base'
     autonomy_level: int = 2
     comms_policy: str = 'store-and-forward'
@@ -71,6 +107,13 @@ def build_patch(spec: ConOpsInput):
                 "autonomy_level": spec.autonomy_level,
             },
         },
+        "ops_timeline": {
+            "phases": [p.model_dump() for p in spec.phases],
+            "windows": [w.model_dump() for w in spec.windows],
+            "window_masks": [w.model_dump() for w in spec.window_masks],
+            "activities": [a.model_dump() for a in spec.activities],
+            "timeline_rows": spec.timeline_rows,
+        }
     }
 
 
@@ -150,7 +193,7 @@ def export_spec(spec: ConOpsInput):
         f"**Template:** {spec.template}\n\n"
         f"**Policies:**\n- Autonomy level: {spec.autonomy_level}\n- Comms policy: {spec.comms_policy}\n\n"
         f"**Constraints:**\n- Max mass: {spec.max_mass_kg} kg\n- Max power: {spec.max_power_w} W\n- Downlink: {spec.downlink_gb_per_day} GB/day\n\n"
-        f"**Phases:**\n" + "\n".join([f"- {p.name}" for p in sorted(spec.phases, key=lambda x: x.order)]) + "\n"
+        f"**Phases:**\n" + "\n".join([f"- {p.name} (duration={p.duration})" for p in sorted(spec.phases, key=lambda x: x.order)]) + "\n"
     )
     summary_path.write_text(summary)
     return {"mission": mission_path.name, "patch": patch_path.name, "summary": summary_path.name}
