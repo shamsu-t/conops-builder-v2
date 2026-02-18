@@ -1,0 +1,10 @@
+.venv/
+node_modules/
+web/node_modules/
+web/dist/
+web/.vite/
+data/
+exports/
+__pycache__/
+*.pyc
+*.log
