@@ -49,6 +49,8 @@ class WindowMask(BaseModel):
     start: float
     end: float
     mode: str = 'allow'  # allow | deny
+    source_type: str = 'ground_contact'
+    source_ref: str = ''
 
     @model_validator(mode='after')
     def validate_mask(self):
@@ -64,6 +66,11 @@ class Activity(BaseModel):
     duration: float = Field(default=1, gt=0)
     row: int = 0
 
+class RequirementRule(BaseModel):
+    activity_type: str
+    rule: str
+    threshold: str = ''
+
 class ConOpsInput(BaseModel):
     intent: str
     stakeholders: str
@@ -71,6 +78,7 @@ class ConOpsInput(BaseModel):
     windows: List[Window] = []
     window_masks: List[WindowMask] = []
     activities: List[Activity] = []
+    requirement_rules: List[RequirementRule] = []
     timeline_rows: List[str] = []
     template: str = 'base'
     autonomy_level: int = 2
@@ -109,10 +117,24 @@ def build_patch(spec: ConOpsInput):
         },
         "ops_timeline": {
             "phases": [p.model_dump() for p in spec.phases],
-            "windows": [w.model_dump() for w in spec.windows],
+            "windows": [w.model_dump() for w in spec.windows],  # legacy compatibility
             "window_masks": [w.model_dump() for w in spec.window_masks],
             "activities": [a.model_dump() for a in spec.activities],
             "timeline_rows": spec.timeline_rows,
+        },
+        "operational_contract": {
+            "intent": spec.intent,
+            "stakeholders": spec.stakeholders,
+            "objectives": {"profile": spec.template},
+            "phase_policies": {
+                "autonomy_level": spec.autonomy_level,
+                "comms_policy": spec.comms_policy,
+            },
+            "window_sources": [w.model_dump() for w in spec.window_masks],
+            "activity_gating_rules": [r.model_dump() for r in spec.requirement_rules],
+            "traceability": {
+                "notes": "Declarative ConOps contract; TradeSpaceKit computes feasibility/windows per design point."
+            }
         }
     }
 
@@ -193,7 +215,9 @@ def export_spec(spec: ConOpsInput):
         f"**Template:** {spec.template}\n\n"
         f"**Policies:**\n- Autonomy level: {spec.autonomy_level}\n- Comms policy: {spec.comms_policy}\n\n"
         f"**Constraints:**\n- Max mass: {spec.max_mass_kg} kg\n- Max power: {spec.max_power_w} W\n- Downlink: {spec.downlink_gb_per_day} GB/day\n\n"
-        f"**Phases:**\n" + "\n".join([f"- {p.name} (duration={p.duration})" for p in sorted(spec.phases, key=lambda x: x.order)]) + "\n"
+        f"**Phases:**\n" + "\n".join([f"- {p.name} (duration={p.duration})" for p in sorted(spec.phases, key=lambda x: x.order)]) + "\n\n"
+        f"**Window Masks:**\n" + "\n".join([f"- {w.name}: {w.mode} {w.start}-{w.end} ({w.source_type})" for w in spec.window_masks]) + "\n\n"
+        f"**Gating Rules:**\n" + ("\n".join([f"- {r.activity_type}: {r.rule} {r.threshold}" for r in spec.requirement_rules]) if spec.requirement_rules else "- None") + "\n"
     )
     summary_path.write_text(summary)
     return {"mission": mission_path.name, "patch": patch_path.name, "summary": summary_path.name}

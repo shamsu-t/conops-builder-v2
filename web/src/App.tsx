@@ -12,9 +12,10 @@ type Phase = { name: string; duration: number }
 
 type Window = { name: string; start: number; end: number }
 
-type WindowMask = { name: string; start: number; end: number; mode: 'allow' | 'deny' }
+type WindowMask = { name: string; start: number; end: number; mode: 'allow' | 'deny'; source_type: string; source_ref?: string }
 
 type Activity = { id: string; name: string; start: number; duration: number; row: number }
+type RequirementRule = { activity_type: string; rule: string; threshold?: string }
 
 type Interval = { start: number; end: number }
 
@@ -59,9 +60,9 @@ const buildAllowedIntervals = (totalDuration: number, windows: Window[], masks: 
   const legacyAllows = windows.map(w => ({ start: w.start, end: w.end }))
   const allowMasks = masks.filter(m => m.mode === 'allow').map(m => ({ start: m.start, end: m.end }))
   const denyMasks = masks.filter(m => m.mode === 'deny').map(m => ({ start: m.start, end: m.end }))
-  const base = allowMasks.length > 0 || legacyAllows.length > 0
-    ? normalizeIntervals([...allowMasks, ...legacyAllows])
-    : [{ start: 0, end: totalDuration }]
+  const base = allowMasks.length > 0
+    ? normalizeIntervals(allowMasks)
+    : (legacyAllows.length > 0 ? normalizeIntervals(legacyAllows) : [{ start: 0, end: totalDuration }])
   const trimmed = base.map(i => ({ start: clamp(i.start, 0, totalDuration), end: clamp(i.end, 0, totalDuration) }))
   const allowed = subtractIntervals(normalizeIntervals(trimmed), normalizeIntervals(denyMasks))
   return allowed
@@ -87,7 +88,7 @@ const nearestAllowedStart = (desired: number, duration: number, allowed: Interva
   return bestStart
 }
 
-const explainPlacement = (activity: Activity, allowed: Interval[], deny: Interval[]) => {
+const explainPlacement = (activity: Activity, allowed: Interval[], deny: Interval[], masks: WindowMask[], rules: RequirementRule[]) => {
   const start = activity.start
   const end = activity.start + activity.duration
   const messages: string[] = []
@@ -100,6 +101,32 @@ const explainPlacement = (activity: Activity, allowed: Interval[], deny: Interva
   if (overlapDeny.length > 0) {
     messages.push('Activity overlaps deny windows')
   }
+
+  const contactOverlap = masks
+    .filter(m => m.mode === 'allow' && m.source_type === 'ground_contact')
+    .some(m => !(end <= m.start || start >= m.end))
+  const commBlackoutOverlap = masks
+    .filter(m => m.mode === 'deny' && m.source_type === 'comms_blackout')
+    .some(m => !(end <= m.start || start >= m.end))
+
+  const activityType = activity.name.toLowerCase()
+  rules.forEach(r => {
+    if (r.activity_type.toLowerCase() !== activityType) return
+    if (r.rule === 'requires_contact' && !contactOverlap) {
+      messages.push('Rule failed: requires contact window overlap')
+    }
+    if (r.rule === 'requires_contact_or_blackout_leq') {
+      const ok = contactOverlap || !commBlackoutOverlap
+      if (!ok) messages.push(`Rule failed: requires contact OR comm_blackout <= ${r.threshold || 'X'}`)
+    }
+    if (r.rule === 'forbid_during_eclipse') {
+      const eclipseOverlap = masks
+        .filter(m => m.mode === 'deny' && m.source_type === 'eclipse')
+        .some(m => !(end <= m.start || start >= m.end))
+      if (eclipseOverlap) messages.push('Rule failed: forbidden during eclipse')
+    }
+  })
+
   return { ok: messages.length === 0, messages }
 }
 
@@ -128,7 +155,10 @@ export default function App() {
   const [newWindow, setNewWindow] = useState<Window>({ name: '', start: 0, end: 1 })
 
   const [windowMasks, setWindowMasks] = useState<WindowMask[]>([])
-  const [newMask, setNewMask] = useState<WindowMask>({ name: '', start: 0, end: 1, mode: 'allow' })
+  const [newMask, setNewMask] = useState<WindowMask>({ name: '', start: 0, end: 1, mode: 'allow', source_type: 'ground_contact', source_ref: '' })
+
+  const [requirementRules, setRequirementRules] = useState<RequirementRule[]>([])
+  const [newRule, setNewRule] = useState<RequirementRule>({ activity_type: 'capture', rule: 'requires_contact_or_blackout_leq', threshold: '120s' })
 
   const [rows, setRows] = useState<string[]>(['Row A', 'Row B', 'Row C'])
   const [newRow, setNewRow] = useState('')
@@ -210,7 +240,15 @@ export default function App() {
     setDownlink(d.downlink_gb_per_day)
     setPhases(d.phases.map((p: any) => ({ name: p.name, duration: p.duration || 1 })))
     setWindows(d.windows || [])
-    setWindowMasks(d.window_masks || [])
+    setWindowMasks((d.window_masks || []).map((m: any) => ({
+      name: m.name,
+      start: m.start,
+      end: m.end,
+      mode: m.mode || 'allow',
+      source_type: m.source_type || 'ground_contact',
+      source_ref: m.source_ref || ''
+    })))
+    setRequirementRules(d.requirement_rules || [])
     setRows(d.timeline_rows && d.timeline_rows.length > 0 ? d.timeline_rows : ['Row A', 'Row B', 'Row C'])
     setActivities((d.activities || []).map((a: any, idx: number) => ({ id: a.id || `${idx}-${a.name}`, name: a.name, start: a.start, duration: a.duration || 1, row: a.row || 0 })))
   }
@@ -228,6 +266,7 @@ export default function App() {
     windows,
     window_masks: windowMasks,
     activities: activities.map(a => ({ name: a.name, start: a.start, duration: a.duration, row: a.row })),
+    requirement_rules: requirementRules,
     timeline_rows: rows
   })
 
@@ -318,7 +357,7 @@ export default function App() {
   }, [activities, allowedIntervals, totalDuration])
 
   const selectedActivity = activities.find(a => a.id === selectedActivityId) || null
-  const selectedExplain = selectedActivity ? explainPlacement(selectedActivity, allowedIntervals, denyIntervals) : null
+  const selectedExplain = selectedActivity ? explainPlacement(selectedActivity, allowedIntervals, denyIntervals, windowMasks, requirementRules) : null
 
   return (
     <Container maxWidth="lg" sx={{ py: 4 }}>
@@ -365,7 +404,8 @@ export default function App() {
       </Paper>
 
       <Paper sx={{ p: 2, mb: 3 }}>
-        <Typography variant="h6">Windows (Legacy Allow)</Typography>
+        <Typography variant="h6">Legacy Windows (Compatibility)</Typography>
+        <Typography variant="caption" color="text.secondary">Optional. Used only when no allow masks exist.</Typography>
         <Stack direction="row" spacing={2} sx={{ mt: 1 }}>
           <TextField label="Name" value={newWindow.name} onChange={e => setNewWindow({ ...newWindow, name: e.target.value })} />
           <TextField type="number" label="Start" value={newWindow.start} onChange={e => setNewWindow({ ...newWindow, start: parseFloat(e.target.value) })} />
@@ -374,7 +414,7 @@ export default function App() {
             if (!newWindow.name) return
             setWindows([...windows, newWindow])
             setNewWindow({ name: '', start: 0, end: 1 })
-          }}>Add Window</Button>
+          }}>Add Legacy Window</Button>
         </Stack>
         <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap' }}>
           {windows.map((w, i) => (
@@ -384,24 +424,59 @@ export default function App() {
       </Paper>
 
       <Paper sx={{ p: 2, mb: 3 }}>
-        <Typography variant="h6">Window Masks (Allow / Deny)</Typography>
-        <Stack direction="row" spacing={2} sx={{ mt: 1 }}>
+        <Typography variant="h6">Window Masks (Primary)</Typography>
+        <Typography variant="caption" color="text.secondary">Declarative allow/forbid masks with source types. TradeSpaceKit computes real windows per design point.</Typography>
+        <Stack direction="row" spacing={2} sx={{ mt: 1, flexWrap: 'wrap' }}>
           <TextField label="Name" value={newMask.name} onChange={e => setNewMask({ ...newMask, name: e.target.value })} />
           <TextField select label="Mode" value={newMask.mode} onChange={e => setNewMask({ ...newMask, mode: e.target.value as WindowMask['mode'] })}>
             <MenuItem value="allow">allow</MenuItem>
             <MenuItem value="deny">deny</MenuItem>
           </TextField>
+          <TextField select label="Source Type" value={newMask.source_type} onChange={e => setNewMask({ ...newMask, source_type: e.target.value })}>
+            <MenuItem value="ground_contact">ground_contact</MenuItem>
+            <MenuItem value="imaging_window">imaging_window</MenuItem>
+            <MenuItem value="approach_window">approach_window</MenuItem>
+            <MenuItem value="thruster_allowed">thruster_allowed</MenuItem>
+            <MenuItem value="comms_blackout">comms_blackout</MenuItem>
+            <MenuItem value="eclipse">eclipse</MenuItem>
+            <MenuItem value="star_tracker_blinding">star_tracker_blinding</MenuItem>
+            <MenuItem value="keep_out_geometry">keep_out_geometry</MenuItem>
+          </TextField>
+          <TextField label="Source Ref" value={newMask.source_ref || ''} onChange={e => setNewMask({ ...newMask, source_ref: e.target.value })} />
           <TextField type="number" label="Start" value={newMask.start} onChange={e => setNewMask({ ...newMask, start: parseFloat(e.target.value) })} />
           <TextField type="number" label="End" value={newMask.end} onChange={e => setNewMask({ ...newMask, end: parseFloat(e.target.value) })} />
           <Button variant="outlined" onClick={() => {
             if (!newMask.name) return
             setWindowMasks([...windowMasks, newMask])
-            setNewMask({ name: '', start: 0, end: 1, mode: 'allow' })
+            setNewMask({ name: '', start: 0, end: 1, mode: 'allow', source_type: 'ground_contact', source_ref: '' })
           }}>Add Mask</Button>
         </Stack>
         <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap' }}>
           {windowMasks.map((w, i) => (
-            <Chip key={i} color={w.mode === 'deny' ? 'warning' : 'success'} label={`${w.name} (${w.mode} ${w.start}-${w.end})`} onDelete={() => setWindowMasks(windowMasks.filter((_, j) => j !== i))} />
+            <Chip key={i} color={w.mode === 'deny' ? 'warning' : 'success'} label={`${w.name} (${w.mode} ${w.start}-${w.end}, ${w.source_type})`} onDelete={() => setWindowMasks(windowMasks.filter((_, j) => j !== i))} />
+          ))}
+        </Stack>
+      </Paper>
+
+      <Paper sx={{ p: 2, mb: 3 }}>
+        <Typography variant="h6">Activity Gating Rules (Operational Contract)</Typography>
+        <Stack direction="row" spacing={2} sx={{ mt: 1, flexWrap: 'wrap' }}>
+          <TextField label="Activity Type" value={newRule.activity_type} onChange={e => setNewRule({ ...newRule, activity_type: e.target.value })} />
+          <TextField select label="Rule" value={newRule.rule} onChange={e => setNewRule({ ...newRule, rule: e.target.value })}>
+            <MenuItem value="requires_contact">requires_contact</MenuItem>
+            <MenuItem value="requires_contact_or_blackout_leq">requires_contact_or_blackout_leq</MenuItem>
+            <MenuItem value="forbid_during_eclipse">forbid_during_eclipse</MenuItem>
+          </TextField>
+          <TextField label="Threshold" value={newRule.threshold || ''} onChange={e => setNewRule({ ...newRule, threshold: e.target.value })} />
+          <Button variant="outlined" onClick={() => {
+            if (!newRule.activity_type || !newRule.rule) return
+            setRequirementRules([...requirementRules, newRule])
+            setNewRule({ activity_type: 'capture', rule: 'requires_contact_or_blackout_leq', threshold: '120s' })
+          }}>Add Rule</Button>
+        </Stack>
+        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap' }}>
+          {requirementRules.map((r, i) => (
+            <Chip key={i} label={`${r.activity_type}: ${r.rule}${r.threshold ? ` (${r.threshold})` : ''}`} onDelete={() => setRequirementRules(requirementRules.filter((_, j) => j !== i))} />
           ))}
         </Stack>
       </Paper>
@@ -462,7 +537,7 @@ export default function App() {
                   {rowActivities.map(activity => {
                     const left = totalDuration > 0 ? (activity.start / totalDuration) * 100 : 0
                     const width = totalDuration > 0 ? (activity.duration / totalDuration) * 100 : 0
-                    const explain = explainPlacement(activity, allowedIntervals, denyIntervals)
+                    const explain = explainPlacement(activity, allowedIntervals, denyIntervals, windowMasks, requirementRules)
                     return (
                       <Box
                         key={activity.id}
