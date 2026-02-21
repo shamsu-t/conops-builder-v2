@@ -7,13 +7,28 @@ const API_BASE = window.location.hostname === 'localhost' || window.location.hos
   : `http://${window.location.hostname}:5071`
 
 const SNAP_STEP = 0.25
+const ACTIVITY_TYPES = ['capture','downlink','imaging','autonomous_actuation','maneuver','inspection']
+const CONSTRAINT_CARDS = [
+  'Capture safety gate',
+  'Storm blackout tolerance',
+  'Imaging eclipse gate',
+  'Approach keep-out gate'
+]
+
+const WIZARD_STEPS = [
+  { id: 'step-intent', title: '1) Intent & stakeholders' },
+  { id: 'step-phases', title: '2) Phases & timeline' },
+  { id: 'step-windows', title: '3) Window/source rules' },
+  { id: 'step-activities', title: '4) Activities & gating rules' },
+  { id: 'step-review', title: '5) Review, conflicts, export' }
+]
 
 type Phase = { name: string; duration: number }
 
 type SourceRule = { name: string; mode: 'allow' | 'deny'; source_type: string; source_ref?: string }
 type ManualTimeBlock = { name: string; start: number; end: number; mode: 'allow' | 'deny'; source_type?: string }
 
-type Activity = { id: string; name: string; start: number; duration: number; row: number }
+type Activity = { id: string; name: string; activity_type: string; start: number; duration: number; row: number }
 type RequirementRule = { activity_type: string; rule: string; threshold?: string }
 type PhasePolicyOverride = { phase: string; autonomy_level?: number; comms_policy?: string }
 
@@ -104,7 +119,7 @@ const explainPlacement = (activity: Activity, allowed: Interval[], deny: Interva
   const hasContactSource = sources.some(m => m.mode === 'allow' && m.source_type === 'ground_contact')
   const hasCommsBlackoutSource = sources.some(m => m.mode === 'deny' && m.source_type === 'comms_blackout')
 
-  const activityType = activity.name.toLowerCase()
+  const activityType = (activity.activity_type || activity.name).toLowerCase()
   rules.forEach(r => {
     if (r.activity_type.toLowerCase() !== activityType) return
     if (r.rule === 'requires_contact' && !hasContactSource) {
@@ -158,12 +173,14 @@ export default function App() {
   const [newRow, setNewRow] = useState('')
 
   const [activities, setActivities] = useState<Activity[]>([])
-  const [newActivity, setNewActivity] = useState({ name: '', duration: 1, row: 0 })
+  const [newActivity, setNewActivity] = useState({ name: '', activity_type: 'capture', duration: 1, row: 0 })
   const [selectedActivityId, setSelectedActivityId] = useState<string | null>(null)
 
   const [projectName, setProjectName] = useState('')
   const [projects, setProjects] = useState<any[]>([])
   const [status, setStatus] = useState<string>('')
+  const [wizardStep, setWizardStep] = useState(0)
+  const [enabledCards, setEnabledCards] = useState<string[]>([])
 
   const timelineRefs = useRef<Map<string, HTMLDivElement>>(new Map())
   const dragState = useRef<{ id: string; originX: number; originStart: number; width: number; total: number } | null>(null)
@@ -250,7 +267,7 @@ export default function App() {
     setRequirementRules(d.requirement_rules || [])
     setPhaseOverrides(d.phase_policy_overrides || [])
     setRows(d.timeline_rows && d.timeline_rows.length > 0 ? d.timeline_rows : ['Row A', 'Row B', 'Row C'])
-    setActivities((d.activities || []).map((a: any, idx: number) => ({ id: a.id || `${idx}-${a.name}`, name: a.name, start: a.start, duration: a.duration || 1, row: a.row || 0 })))
+    setActivities((d.activities || []).map((a: any, idx: number) => ({ id: a.id || `${idx}-${a.name}`, name: a.name, activity_type: a.activity_type || a.name, start: a.start, duration: a.duration || 1, row: a.row || 0 })))
   }
 
   useEffect(() => {
@@ -278,7 +295,7 @@ export default function App() {
     phases: phases.map((p, i) => ({ name: p.name, order: i, duration: p.duration })),
     source_rules: sourceRules,
     manual_time_blocks: manualBlocks,
-    activities: activities.map(a => ({ name: a.name, start: a.start, duration: a.duration, row: a.row })),
+    activities: activities.map(a => ({ name: a.name, activity_type: a.activity_type, start: a.start, duration: a.duration, row: a.row })),
     requirement_rules: requirementRules,
     phase_policy_overrides: phaseOverrides,
     timeline_rows: rows
@@ -312,6 +329,41 @@ export default function App() {
     setNewRow('')
   }
 
+  const goToStep = (idx: number) => {
+    const bounded = Math.max(0, Math.min(idx, WIZARD_STEPS.length - 1))
+    setWizardStep(bounded)
+    const id = WIZARD_STEPS[bounded].id
+    requestAnimationFrame(() => {
+      const el = document.getElementById(id)
+      if (el) {
+        const y = el.getBoundingClientRect().top + window.pageYOffset - 180
+        window.scrollTo({ top: y, behavior: 'smooth' })
+      }
+    })
+  }
+
+  const applyConstraintCard = (card: string) => {
+    if (enabledCards.includes(card)) return
+    setEnabledCards(prev => [...prev, card])
+
+    if (card === 'Capture safety gate') {
+      setRequirementRules(prev => [...prev, { activity_type: 'capture', rule: 'requires_contact_or_blackout_leq', threshold: '120s' }])
+      setSourceRules(prev => [...prev, { name: 'Capture contact required', mode: 'allow', source_type: 'ground_contact', source_ref: 'safety_gate' }])
+    }
+    if (card === 'Storm blackout tolerance') {
+      setSourceRules(prev => [...prev, { name: 'Storm blackout', mode: 'deny', source_type: 'comms_blackout', source_ref: 'storm_mode' }])
+      setRequirementRules(prev => [...prev, { activity_type: 'capture', rule: 'requires_contact_or_blackout_leq', threshold: '120s' }])
+    }
+    if (card === 'Imaging eclipse gate') {
+      setSourceRules(prev => [...prev, { name: 'Eclipse', mode: 'deny', source_type: 'eclipse', source_ref: 'imaging_guard' }])
+      setRequirementRules(prev => [...prev, { activity_type: 'imaging', rule: 'forbid_during_eclipse', threshold: '' }])
+    }
+    if (card === 'Approach keep-out gate') {
+      setSourceRules(prev => [...prev, { name: 'Keep-out geometry', mode: 'deny', source_type: 'keep_out_geometry', source_ref: 'approach_guard' }])
+      setRequirementRules(prev => [...prev, { activity_type: 'maneuver', rule: 'requires_contact', threshold: '' }])
+    }
+  }
+
   const removeRow = (idx: number) => {
     if (rows.length <= 1) return
     setRows(prev => prev.filter((_, i) => i !== idx))
@@ -325,8 +377,8 @@ export default function App() {
     if (!newActivity.name.trim()) return
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
     const start = snapToStep(0)
-    setActivities([...activities, { id, name: newActivity.name.trim(), start, duration: newActivity.duration || 1, row: newActivity.row }])
-    setNewActivity({ name: '', duration: 1, row: newActivity.row })
+    setActivities([...activities, { id, name: newActivity.name.trim(), activity_type: newActivity.activity_type || newActivity.name.trim(), start, duration: newActivity.duration || 1, row: newActivity.row }])
+    setNewActivity({ name: '', activity_type: newActivity.activity_type, duration: 1, row: newActivity.row })
   }
 
   const updateActivity = (id: string, patch: Partial<Activity>) => {
@@ -405,6 +457,18 @@ export default function App() {
     <Container maxWidth="lg" sx={{ py: 4 }}>
       <Typography variant="h4" gutterBottom>ConOps Builder v2</Typography>
 
+      <Paper sx={{ p: 2, mb: 3, bgcolor: '#f8fafc', position: 'sticky', top: 0, zIndex: 10, border: '1px solid #e5e7eb' }}>
+        <Typography variant="h6">Guided Wizard</Typography>
+        <Typography variant="caption" color="text.secondary">Follow these steps in order; you can still edit any section directly.</Typography>
+        <Stack direction="row" spacing={1} sx={{ mt: 1, flexWrap: 'wrap', rowGap: 1 }}>
+          {WIZARD_STEPS.map((s, idx) => (
+            <Button key={s.id} size="small" variant={idx === wizardStep ? 'contained' : 'outlined'} onClick={() => goToStep(idx)}>
+              {s.title}
+            </Button>
+          ))}
+        </Stack>
+      </Paper>
+
       <Paper sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Project Storage</Typography>
         <Stack direction="row" spacing={2} sx={{ mt: 1 }}>
@@ -419,13 +483,13 @@ export default function App() {
         </Stack>
       </Paper>
 
-      <Paper sx={{ p: 2, mb: 3 }}>
+      <Paper id="step-intent" sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Intent + Stakeholders</Typography>
         <TextField fullWidth label="Mission intent" sx={{ mt: 1 }} value={intent} onChange={e => setIntent(e.target.value)} />
         <TextField fullWidth label="Stakeholders" sx={{ mt: 2 }} value={stakeholders} onChange={e => setStakeholders(e.target.value)} />
       </Paper>
 
-      <Paper sx={{ p: 2, mb: 3 }}>
+      <Paper id="step-phases" sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Phases Timeline</Typography>
         <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap', mt: 1 }}>
           {phases.map((p, i) => (
@@ -460,7 +524,7 @@ export default function App() {
         </TextField>
       </Paper>
 
-      <Paper sx={{ p: 2, mb: 3 }}>
+      <Paper id="step-windows" sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Window Source Rules (Declarative)</Typography>
         <Typography variant="caption" color="text.secondary">Use this for recurring/derived sources (e.g., ground contact, eclipse). No time intervals here — TradeSpaceKit computes those per design point.</Typography>
         <Box sx={{ mt: 1, display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 1, alignItems: 'start' }}>
@@ -521,7 +585,9 @@ export default function App() {
         <Typography variant="h6">Activity Gating Rules (Operational Contract)</Typography>
         <Typography variant="caption" color="text.secondary">Activity type is semantic (capture/imaging/downlink). It is independent from visual row lanes.</Typography>
         <Stack direction="row" spacing={2} sx={{ mt: 1, flexWrap: 'wrap' }}>
-          <TextField label="Activity Type" value={newRule.activity_type} onChange={e => setNewRule({ ...newRule, activity_type: e.target.value })} />
+          <TextField select label="Activity Type" value={newRule.activity_type} onChange={e => setNewRule({ ...newRule, activity_type: e.target.value })}>
+            {ACTIVITY_TYPES.map(t => (<MenuItem key={t} value={t}>{t}</MenuItem>))}
+          </TextField>
           <TextField select label="Rule" value={newRule.rule} onChange={e => setNewRule({ ...newRule, rule: e.target.value })}>
             <MenuItem value="requires_contact">requires_contact</MenuItem>
             <MenuItem value="requires_contact_or_blackout_leq">requires_contact_or_blackout_leq</MenuItem>
@@ -562,7 +628,7 @@ export default function App() {
         </Stack>
       </Paper>
 
-      <Paper sx={{ p: 2, mb: 3 }}>
+      <Paper id="step-activities" sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Activity Timeline (Multi-row)</Typography>
         <Typography variant="caption" color="text.secondary">Rows are activity lanes (e.g., Sensing, Comms, Actuation). Add/remove lanes as needed.</Typography>
         <Stack direction="row" spacing={2} sx={{ mt: 1 }}>
@@ -574,8 +640,11 @@ export default function App() {
             <Chip key={`${r}-${idx}`} label={r} onDelete={() => removeRow(idx)} />
           ))}
         </Stack>
-        <Stack direction="row" spacing={2} sx={{ mt: 2 }}>
-          <TextField label="Activity" value={newActivity.name} onChange={e => setNewActivity({ ...newActivity, name: e.target.value })} />
+        <Stack direction="row" spacing={2} sx={{ mt: 2, flexWrap:'wrap' }}>
+          <TextField label="Activity label" value={newActivity.name} onChange={e => setNewActivity({ ...newActivity, name: e.target.value })} />
+          <TextField select label="Activity type" value={newActivity.activity_type} onChange={e => setNewActivity({ ...newActivity, activity_type: e.target.value })}>
+            {ACTIVITY_TYPES.map(t => (<MenuItem key={t} value={t}>{t}</MenuItem>))}
+          </TextField>
           <TextField type="number" label="Duration" value={newActivity.duration} onChange={e => setNewActivity({ ...newActivity, duration: parseFloat(e.target.value) || 1 })} />
           <TextField select label="Row" value={newActivity.row} onChange={e => setNewActivity({ ...newActivity, row: parseInt(e.target.value) })}>
             {rows.map((r, idx) => (<MenuItem key={r} value={idx}>{r}</MenuItem>))}
@@ -588,11 +657,14 @@ export default function App() {
 
         <Box sx={{ border: '1px solid #ddd', borderRadius: 1 }}>
           <Box sx={{ display: 'flex', borderBottom: '1px solid #eee' }}>
-            {phasesWithOffsets.map((p, i) => (
-              <Box key={i} sx={{ flex: p.duration, p: 1, textAlign: 'center', bgcolor: '#fafafa', borderRight: '1px solid #eee' }}>
-                <Typography variant="caption" noWrap title={p.name} sx={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</Typography>
-              </Box>
-            ))}
+            <Box sx={{ width: 140, borderRight: '1px solid #eee', bgcolor: '#fafafa' }} />
+            <Box sx={{ display:'flex', flex:1 }}>
+              {phasesWithOffsets.map((p, i) => (
+                <Box key={i} sx={{ flex: p.duration, p: 1, textAlign: 'center', bgcolor: '#fafafa', borderRight: '1px solid #eee' }}>
+                  <Typography variant="caption" noWrap title={p.name} sx={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</Typography>
+                </Box>
+              ))}
+            </Box>
           </Box>
           {rows.map((row, rowIndex) => {
             const rowKey = `${rowIndex}`
@@ -666,7 +738,7 @@ export default function App() {
         <Typography variant="subtitle2">Activities</Typography>
         <Stack direction="row" spacing={1} sx={{ mt: 1, flexWrap: 'wrap' }}>
           {activities.map(a => (
-            <Chip key={a.id} label={`${a.name} (${a.start.toFixed(2)}-${(a.start + a.duration).toFixed(2)})`} onClick={() => setSelectedActivityId(a.id)} onDelete={() => setActivities(activities.filter(x => x.id !== a.id))} />
+            <Chip key={a.id} label={`${a.name} [${a.activity_type}] (${a.start.toFixed(2)}-${(a.start + a.duration).toFixed(2)})`} onClick={() => setSelectedActivityId(a.id)} onDelete={() => setActivities(activities.filter(x => x.id !== a.id))} />
           ))}
         </Stack>
       </Paper>
@@ -675,7 +747,7 @@ export default function App() {
         <Typography variant="h6">Explain-Why Panel</Typography>
         {selectedActivity ? (
           <Box sx={{ mt: 1 }}>
-            <Typography variant="subtitle2">{selectedActivity.name}</Typography>
+            <Typography variant="subtitle2">{selectedActivity.name} <span style={{fontWeight:400,color:'#666'}}>({selectedActivity.activity_type})</span></Typography>
             <Typography variant="body2">Start: {selectedActivity.start.toFixed(2)} | Duration: {selectedActivity.duration}</Typography>
             {selectedExplain && selectedExplain.ok ? (
               <Typography variant="body2" color="success.main" sx={{ mt: 1 }}>Placement is valid.</Typography>
@@ -699,7 +771,7 @@ export default function App() {
         )}
       </Paper>
 
-      <Paper sx={{ p: 2, mb: 3 }}>
+      <Paper id="step-review" sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Conflict Checker</Typography>
         {conflicts.length === 0 ? (
           <Typography variant="body2" color="success.main">No obvious contradictions detected.</Typography>
@@ -713,6 +785,18 @@ export default function App() {
       </Paper>
 
 
+
+      <Paper sx={{ p: 2, mb: 3 }}>
+        <Typography variant="h6">Constraint Cards + Safety Gates</Typography>
+        <Typography variant="caption" color="text.secondary">Quick presets for common safety/ops constraints. You can still edit rules manually.</Typography>
+        <Stack direction="row" spacing={1} sx={{ mt: 1, flexWrap: 'wrap', rowGap: 1 }}>
+          {CONSTRAINT_CARDS.map(card => (
+            <Button key={card} size="small" variant={enabledCards.includes(card) ? 'contained' : 'outlined'} onClick={() => applyConstraintCard(card)}>
+              {card}
+            </Button>
+          ))}
+        </Stack>
+      </Paper>
 
       <Paper sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Policies + Constraints</Typography>
