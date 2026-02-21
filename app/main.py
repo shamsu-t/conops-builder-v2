@@ -60,6 +60,33 @@ class WindowMask(BaseModel):
             raise ValueError("window_mask.mode must be 'allow' or 'deny'")
         return self
 
+class SourceRule(BaseModel):
+    name: str
+    mode: str = 'allow'  # allow | deny
+    source_type: str = 'ground_contact'
+    source_ref: str = ''
+
+    @model_validator(mode='after')
+    def validate_rule(self):
+        if self.mode not in {'allow', 'deny'}:
+            raise ValueError("source_rule.mode must be 'allow' or 'deny'")
+        return self
+
+class ManualTimeBlock(BaseModel):
+    name: str
+    start: float
+    end: float
+    mode: str = 'allow'
+    source_type: str = 'manual'
+
+    @model_validator(mode='after')
+    def validate_block(self):
+        if self.end <= self.start:
+            raise ValueError('manual_time_block.end must be > manual_time_block.start')
+        if self.mode not in {'allow', 'deny'}:
+            raise ValueError("manual_time_block.mode must be 'allow' or 'deny'")
+        return self
+
 class Activity(BaseModel):
     name: str
     start: float
@@ -81,7 +108,9 @@ class ConOpsInput(BaseModel):
     stakeholders: str
     phases: List[Phase]
     windows: List[Window] = []
-    window_masks: List[WindowMask] = []
+    window_masks: List[WindowMask] = []  # legacy payload compatibility
+    source_rules: List[SourceRule] = []
+    manual_time_blocks: List[ManualTimeBlock] = []
     activities: List[Activity] = []
     requirement_rules: List[RequirementRule] = []
     phase_policy_overrides: List[PhasePolicyOverride] = []
@@ -110,6 +139,17 @@ def deep_merge(base, patch):
 
 
 def build_patch(spec: ConOpsInput):
+    # compatibility: if old window_masks are sent, treat zero/non-positive ranges as source rules and valid ranges as manual blocks
+    legacy_masks = spec.window_masks or []
+    source_rules = spec.source_rules or []
+    manual_blocks = spec.manual_time_blocks or []
+    if not source_rules and not manual_blocks and legacy_masks:
+        for w in legacy_masks:
+            if w.end > w.start:
+                manual_blocks.append(ManualTimeBlock(name=w.name, start=w.start, end=w.end, mode=w.mode, source_type=w.source_type))
+            else:
+                source_rules.append(SourceRule(name=w.name, mode=w.mode, source_type=w.source_type, source_ref=w.source_ref))
+
     return {
         "study": {"profile": spec.template},
         "mission": {
@@ -123,8 +163,7 @@ def build_patch(spec: ConOpsInput):
         },
         "ops_timeline": {
             "phases": [p.model_dump() for p in spec.phases],
-            "windows": [w.model_dump() for w in spec.windows],  # legacy compatibility
-            "window_masks": [w.model_dump() for w in spec.window_masks],
+            "manual_time_blocks": [w.model_dump() for w in manual_blocks],
             "activities": [a.model_dump() for a in spec.activities],
             "timeline_rows": spec.timeline_rows,
         },
@@ -137,7 +176,7 @@ def build_patch(spec: ConOpsInput):
                 "comms_policy": spec.comms_policy,
                 "overrides": [o.model_dump() for o in spec.phase_policy_overrides],
             },
-            "window_sources": [w.model_dump() for w in spec.window_masks],
+            "window_sources": [w.model_dump() for w in source_rules],
             "activity_gating_rules": [r.model_dump() for r in spec.requirement_rules],
             "traceability": {
                 "notes": "Declarative ConOps contract; TradeSpaceKit computes feasibility/windows per design point."
@@ -223,7 +262,7 @@ def export_spec(spec: ConOpsInput):
         f"**Policies:**\n- Autonomy level: {spec.autonomy_level}\n- Comms policy: {spec.comms_policy}\n\n"
         f"**Constraints:**\n- Max mass: {spec.max_mass_kg} kg\n- Max power: {spec.max_power_w} W\n- Downlink: {spec.downlink_gb_per_day} GB/day\n\n"
         f"**Phases:**\n" + "\n".join([f"- {p.name} (duration={p.duration})" for p in sorted(spec.phases, key=lambda x: x.order)]) + "\n\n"
-        f"**Window Masks:**\n" + "\n".join([f"- {w.name}: {w.mode} {w.start}-{w.end} ({w.source_type})" for w in spec.window_masks]) + "\n\n"
+        f"**Window Source Rules:**\n" + ("\n".join([f"- {w.name}: {w.mode} ({w.source_type})" for w in spec.source_rules]) if spec.source_rules else "- None") + "\n\n"
         f"**Gating Rules:**\n" + ("\n".join([f"- {r.activity_type}: {r.rule} {r.threshold}" for r in spec.requirement_rules]) if spec.requirement_rules else "- None") + "\n"
     )
     summary_path.write_text(summary)

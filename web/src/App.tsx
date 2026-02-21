@@ -10,7 +10,8 @@ const SNAP_STEP = 0.25
 
 type Phase = { name: string; duration: number }
 
-type WindowMask = { name: string; start: number; end: number; mode: 'allow' | 'deny'; source_type: string; source_ref?: string }
+type SourceRule = { name: string; mode: 'allow' | 'deny'; source_type: string; source_ref?: string }
+type ManualTimeBlock = { name: string; start: number; end: number; mode: 'allow' | 'deny'; source_type?: string }
 
 type Activity = { id: string; name: string; start: number; duration: number; row: number }
 type RequirementRule = { activity_type: string; rule: string; threshold?: string }
@@ -55,9 +56,9 @@ const subtractIntervals = (base: Interval[], subtract: Interval[]) => {
   return remaining
 }
 
-const buildAllowedIntervals = (totalDuration: number, masks: WindowMask[]) => {
-  const allowMasks = masks.filter(m => m.mode === 'allow').map(m => ({ start: m.start, end: m.end }))
-  const denyMasks = masks.filter(m => m.mode === 'deny').map(m => ({ start: m.start, end: m.end }))
+const buildAllowedIntervals = (totalDuration: number, blocks: ManualTimeBlock[]) => {
+  const allowMasks = blocks.filter(m => m.mode === 'allow').map(m => ({ start: m.start, end: m.end }))
+  const denyMasks = blocks.filter(m => m.mode === 'deny').map(m => ({ start: m.start, end: m.end }))
   const base = allowMasks.length > 0
     ? normalizeIntervals(allowMasks)
     : [{ start: 0, end: totalDuration }]
@@ -86,7 +87,7 @@ const nearestAllowedStart = (desired: number, duration: number, allowed: Interva
   return bestStart
 }
 
-const explainPlacement = (activity: Activity, allowed: Interval[], deny: Interval[], masks: WindowMask[], rules: RequirementRule[]) => {
+const explainPlacement = (activity: Activity, allowed: Interval[], deny: Interval[], sources: SourceRule[], rules: RequirementRule[]) => {
   const start = activity.start
   const end = activity.start + activity.duration
   const messages: string[] = []
@@ -100,28 +101,22 @@ const explainPlacement = (activity: Activity, allowed: Interval[], deny: Interva
     messages.push('Activity overlaps deny windows')
   }
 
-  const contactOverlap = masks
-    .filter(m => m.mode === 'allow' && m.source_type === 'ground_contact')
-    .some(m => !(end <= m.start || start >= m.end))
-  const commBlackoutOverlap = masks
-    .filter(m => m.mode === 'deny' && m.source_type === 'comms_blackout')
-    .some(m => !(end <= m.start || start >= m.end))
+  const hasContactSource = sources.some(m => m.mode === 'allow' && m.source_type === 'ground_contact')
+  const hasCommsBlackoutSource = sources.some(m => m.mode === 'deny' && m.source_type === 'comms_blackout')
 
   const activityType = activity.name.toLowerCase()
   rules.forEach(r => {
     if (r.activity_type.toLowerCase() !== activityType) return
-    if (r.rule === 'requires_contact' && !contactOverlap) {
+    if (r.rule === 'requires_contact' && !hasContactSource) {
       messages.push('Rule failed: requires contact window overlap')
     }
     if (r.rule === 'requires_contact_or_blackout_leq') {
-      const ok = contactOverlap || !commBlackoutOverlap
+      const ok = hasContactSource || !hasCommsBlackoutSource
       if (!ok) messages.push(`Rule failed: requires contact OR comm_blackout <= ${r.threshold || 'X'}`)
     }
     if (r.rule === 'forbid_during_eclipse') {
-      const eclipseOverlap = masks
-        .filter(m => m.mode === 'deny' && m.source_type === 'eclipse')
-        .some(m => !(end <= m.start || start >= m.end))
-      if (eclipseOverlap) messages.push('Rule failed: forbidden during eclipse')
+      const hasEclipseSource = sources.some(m => m.mode === 'deny' && m.source_type === 'eclipse')
+      if (hasEclipseSource) messages.push('Rule check delegated: eclipse windows computed in TradeSpaceKit')
     }
   })
 
@@ -149,8 +144,10 @@ export default function App() {
   const [dragIndex, setDragIndex] = useState<number | null>(null)
   const [exportResult, setExportResult] = useState<any>(null)
 
-  const [windowMasks, setWindowMasks] = useState<WindowMask[]>([])
-  const [newMask, setNewMask] = useState<WindowMask>({ name: '', start: 0, end: 1, mode: 'allow', source_type: 'ground_contact', source_ref: '' })
+  const [sourceRules, setSourceRules] = useState<SourceRule[]>([])
+  const [newSourceRule, setNewSourceRule] = useState<SourceRule>({ name: '', mode: 'allow', source_type: 'ground_contact', source_ref: '' })
+  const [manualBlocks, setManualBlocks] = useState<ManualTimeBlock[]>([])
+  const [newManualBlock, setNewManualBlock] = useState<ManualTimeBlock>({ name: '', start: 0, end: 1, mode: 'allow', source_type: 'manual' })
 
   const [requirementRules, setRequirementRules] = useState<RequirementRule[]>([])
   const [newRule, setNewRule] = useState<RequirementRule>({ activity_type: 'capture', rule: 'requires_contact_or_blackout_leq', threshold: '120s' })
@@ -183,8 +180,8 @@ export default function App() {
 
   const totalDuration = useMemo(() => phasesWithOffsets.reduce((sum, p) => sum + p.duration, 0), [phasesWithOffsets])
 
-  const allowedIntervals = useMemo(() => buildAllowedIntervals(totalDuration, windowMasks), [totalDuration, windowMasks])
-  const denyIntervals = useMemo(() => windowMasks.filter(m => m.mode === 'deny').map(m => ({ start: m.start, end: m.end })), [windowMasks])
+  const allowedIntervals = useMemo(() => buildAllowedIntervals(totalDuration, manualBlocks), [totalDuration, manualBlocks])
+  const denyIntervals = useMemo(() => manualBlocks.filter(m => m.mode === 'deny').map(m => ({ start: m.start, end: m.end })), [manualBlocks])
 
   const addPhase = () => {
     if (!newPhase.trim()) return
@@ -237,13 +234,18 @@ export default function App() {
     setMaxPower(d.max_power_w)
     setDownlink(d.downlink_gb_per_day)
     setPhases(d.phases.map((p: any) => ({ name: p.name, duration: p.duration || 1 })))
-    setWindowMasks((d.window_masks || []).map((m: any) => ({
+    setSourceRules((d.source_rules || d.window_masks || []).map((m: any) => ({
+      name: m.name,
+      mode: (m.mode || 'allow'),
+      source_type: m.source_type || 'ground_contact',
+      source_ref: m.source_ref || ''
+    })))
+    setManualBlocks((d.manual_time_blocks || []).map((m: any) => ({
       name: m.name,
       start: m.start,
       end: m.end,
       mode: m.mode || 'allow',
-      source_type: m.source_type || 'ground_contact',
-      source_ref: m.source_ref || ''
+      source_type: m.source_type || 'manual'
     })))
     setRequirementRules(d.requirement_rules || [])
     setPhaseOverrides(d.phase_policy_overrides || [])
@@ -274,7 +276,8 @@ export default function App() {
     max_power_w: maxPower,
     downlink_gb_per_day: downlink,
     phases: phases.map((p, i) => ({ name: p.name, order: i, duration: p.duration })),
-    window_masks: windowMasks,
+    source_rules: sourceRules,
+    manual_time_blocks: manualBlocks,
     activities: activities.map(a => ({ name: a.name, start: a.start, duration: a.duration, row: a.row })),
     requirement_rules: requirementRules,
     phase_policy_overrides: phaseOverrides,
@@ -377,26 +380,26 @@ export default function App() {
   }, [activities, allowedIntervals, totalDuration])
 
   const selectedActivity = activities.find(a => a.id === selectedActivityId) || null
-  const selectedExplain = selectedActivity ? explainPlacement(selectedActivity, allowedIntervals, denyIntervals, windowMasks, requirementRules) : null
+  const selectedExplain = selectedActivity ? explainPlacement(selectedActivity, allowedIntervals, denyIntervals, sourceRules, requirementRules) : null
 
   const conflicts = useMemo(() => {
     const msgs: string[] = []
-    windowMasks.forEach((a, i) => {
-      if (a.end <= a.start) msgs.push(`Mask '${a.name}' has end <= start`)
-      for (let j = i + 1; j < windowMasks.length; j++) {
-        const b = windowMasks[j]
+    manualBlocks.forEach((a, i) => {
+      if (a.end <= a.start) msgs.push(`Manual block '${a.name}' has end <= start`)
+      for (let j = i + 1; j < manualBlocks.length; j++) {
+        const b = manualBlocks[j]
         const overlap = !(a.end <= b.start || a.start >= b.end)
-        if (overlap && a.mode !== b.mode && a.source_type === b.source_type) {
-          msgs.push(`Conflicting masks overlap: '${a.name}' vs '${b.name}' (${a.source_type})`)
+        if (overlap && a.mode !== b.mode) {
+          msgs.push(`Conflicting manual blocks overlap: '${a.name}' vs '${b.name}'`)
         }
       }
     })
     activities.forEach(act => {
-      const ex = explainPlacement(act, allowedIntervals, denyIntervals, windowMasks, requirementRules)
+      const ex = explainPlacement(act, allowedIntervals, denyIntervals, sourceRules, requirementRules)
       if (!ex.ok) msgs.push(`${act.name}: ${ex.messages.join('; ')}`)
     })
     return msgs
-  }, [windowMasks, activities, allowedIntervals, denyIntervals, requirementRules])
+  }, [manualBlocks, activities, allowedIntervals, denyIntervals, sourceRules, requirementRules])
 
   return (
     <Container maxWidth="lg" sx={{ py: 4 }}>
@@ -457,18 +460,16 @@ export default function App() {
         </TextField>
       </Paper>
 
-      <></>
-
       <Paper sx={{ p: 2, mb: 3 }}>
-        <Typography variant="h6">Window Masks (Primary)</Typography>
-        <Typography variant="caption" color="text.secondary">Use masks as policy constraints on the timeline axis. Start/End are timeline coordinates (same x-axis as activities), not calendar dates. Recurring sources (like ground contact) should be entered as multiple masks for now.</Typography>
-        <Stack direction="row" spacing={2} sx={{ mt: 1, flexWrap: 'wrap' }}>
-          <TextField label="Name" value={newMask.name} onChange={e => setNewMask({ ...newMask, name: e.target.value })} />
-          <TextField select label="Mode" value={newMask.mode} onChange={e => setNewMask({ ...newMask, mode: e.target.value as WindowMask['mode'] })}>
+        <Typography variant="h6">Window Source Rules (Declarative)</Typography>
+        <Typography variant="caption" color="text.secondary">Use this for recurring/derived sources (e.g., ground contact, eclipse). No time intervals here — TradeSpaceKit computes those per design point.</Typography>
+        <Box sx={{ mt: 1, display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 1, alignItems: 'start' }}>
+          <TextField label="Name" value={newSourceRule.name} onChange={e => setNewSourceRule({ ...newSourceRule, name: e.target.value })} />
+          <TextField select label="Mode" value={newSourceRule.mode} onChange={e => setNewSourceRule({ ...newSourceRule, mode: e.target.value as SourceRule['mode'] })}>
             <MenuItem value="allow">allow</MenuItem>
             <MenuItem value="deny">deny</MenuItem>
           </TextField>
-          <TextField select label="Window rule source" value={newMask.source_type} onChange={e => setNewMask({ ...newMask, source_type: e.target.value })}>
+          <TextField select label="Window rule source" value={newSourceRule.source_type} onChange={e => setNewSourceRule({ ...newSourceRule, source_type: e.target.value })}>
             <MenuItem value="ground_contact">ground_contact</MenuItem>
             <MenuItem value="imaging_window">imaging_window</MenuItem>
             <MenuItem value="approach_window">approach_window</MenuItem>
@@ -478,18 +479,40 @@ export default function App() {
             <MenuItem value="star_tracker_blinding">star_tracker_blinding</MenuItem>
             <MenuItem value="keep_out_geometry">keep_out_geometry</MenuItem>
           </TextField>
-          <TextField label="Reference (optional)" value={newMask.source_ref || ''} onChange={e => setNewMask({ ...newMask, source_ref: e.target.value })} />
-          <TextField type="number" label="Timeline start (t)" value={newMask.start} onChange={e => setNewMask({ ...newMask, start: parseFloat(e.target.value) })} />
-          <TextField type="number" label="Timeline end (t)" value={newMask.end} onChange={e => setNewMask({ ...newMask, end: parseFloat(e.target.value) })} />
+          <TextField label="Reference (optional)" value={newSourceRule.source_ref || ''} onChange={e => setNewSourceRule({ ...newSourceRule, source_ref: e.target.value })} />
           <Button variant="outlined" onClick={() => {
-            if (!newMask.name) return
-            setWindowMasks([...windowMasks, newMask])
-            setNewMask({ name: '', start: 0, end: 1, mode: 'allow', source_type: 'ground_contact', source_ref: '' })
-          }}>Add Mask</Button>
-        </Stack>
+            if (!newSourceRule.name) return
+            setSourceRules([...sourceRules, newSourceRule])
+            setNewSourceRule({ name: '', mode: 'allow', source_type: 'ground_contact', source_ref: '' })
+          }}>Add Source Rule</Button>
+        </Box>
         <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap', rowGap: 1, columnGap: 1 }}>
-          {windowMasks.map((w, i) => (
-            <Chip key={i} color={w.mode === 'deny' ? 'warning' : 'success'} label={`${w.name} (${w.mode} ${w.start}-${w.end}, ${w.source_type})`} onDelete={() => setWindowMasks(windowMasks.filter((_, j) => j !== i))} />
+          {sourceRules.map((w, i) => (
+            <Chip key={i} color={w.mode === 'deny' ? 'warning' : 'success'} label={`${w.name} (${w.mode}, ${w.source_type})`} onDelete={() => setSourceRules(sourceRules.filter((_, j) => j !== i))} />
+          ))}
+        </Stack>
+      </Paper>
+
+      <Paper sx={{ p: 2, mb: 3 }}>
+        <Typography variant="h6">Manual Time Blocks (Optional)</Typography>
+        <Typography variant="caption" color="text.secondary">Use only for storyboard/testing constraints on this timeline view.</Typography>
+        <Box sx={{ mt: 1, display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 1, alignItems: 'start' }}>
+          <TextField label="Name" value={newManualBlock.name} onChange={e => setNewManualBlock({ ...newManualBlock, name: e.target.value })} />
+          <TextField select label="Mode" value={newManualBlock.mode} onChange={e => setNewManualBlock({ ...newManualBlock, mode: e.target.value as ManualTimeBlock['mode'] })}>
+            <MenuItem value="allow">allow</MenuItem>
+            <MenuItem value="deny">deny</MenuItem>
+          </TextField>
+          <TextField type="number" label="Timeline start (t)" value={newManualBlock.start} onChange={e => setNewManualBlock({ ...newManualBlock, start: parseFloat(e.target.value) })} />
+          <TextField type="number" label="Timeline end (t)" value={newManualBlock.end} onChange={e => setNewManualBlock({ ...newManualBlock, end: parseFloat(e.target.value) })} />
+          <Button variant="outlined" onClick={() => {
+            if (!newManualBlock.name) return
+            setManualBlocks([...manualBlocks, newManualBlock])
+            setNewManualBlock({ name: '', start: 0, end: 1, mode: 'allow', source_type: 'manual' })
+          }}>Add Manual Block</Button>
+        </Box>
+        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap', rowGap: 1, columnGap: 1 }}>
+          {manualBlocks.map((w, i) => (
+            <Chip key={i} color={w.mode === 'deny' ? 'warning' : 'default'} label={`${w.name} (${w.mode} ${w.start}-${w.end})`} onDelete={() => setManualBlocks(manualBlocks.filter((_, j) => j !== i))} />
           ))}
         </Stack>
       </Paper>
@@ -601,7 +624,7 @@ export default function App() {
                   {rowActivities.map(activity => {
                     const left = totalDuration > 0 ? (activity.start / totalDuration) * 100 : 0
                     const width = totalDuration > 0 ? (activity.duration / totalDuration) * 100 : 0
-                    const explain = explainPlacement(activity, allowedIntervals, denyIntervals, windowMasks, requirementRules)
+                    const explain = explainPlacement(activity, allowedIntervals, denyIntervals, sourceRules, requirementRules)
                     return (
                       <Box
                         key={activity.id}
@@ -688,8 +711,6 @@ export default function App() {
           </Box>
         )}
       </Paper>
-
-      <></>
 
 
 
