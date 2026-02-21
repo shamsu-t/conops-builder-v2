@@ -10,8 +10,6 @@ const SNAP_STEP = 0.25
 
 type Phase = { name: string; duration: number }
 
-type Window = { name: string; start: number; end: number }
-
 type WindowMask = { name: string; start: number; end: number; mode: 'allow' | 'deny'; source_type: string; source_ref?: string }
 
 type Activity = { id: string; name: string; start: number; duration: number; row: number }
@@ -57,13 +55,12 @@ const subtractIntervals = (base: Interval[], subtract: Interval[]) => {
   return remaining
 }
 
-const buildAllowedIntervals = (totalDuration: number, windows: Window[], masks: WindowMask[]) => {
-  const legacyAllows = windows.map(w => ({ start: w.start, end: w.end }))
+const buildAllowedIntervals = (totalDuration: number, masks: WindowMask[]) => {
   const allowMasks = masks.filter(m => m.mode === 'allow').map(m => ({ start: m.start, end: m.end }))
   const denyMasks = masks.filter(m => m.mode === 'deny').map(m => ({ start: m.start, end: m.end }))
   const base = allowMasks.length > 0
     ? normalizeIntervals(allowMasks)
-    : (legacyAllows.length > 0 ? normalizeIntervals(legacyAllows) : [{ start: 0, end: totalDuration }])
+    : [{ start: 0, end: totalDuration }]
   const trimmed = base.map(i => ({ start: clamp(i.start, 0, totalDuration), end: clamp(i.end, 0, totalDuration) }))
   const allowed = subtractIntervals(normalizeIntervals(trimmed), normalizeIntervals(denyMasks))
   return allowed
@@ -152,9 +149,6 @@ export default function App() {
   const [dragIndex, setDragIndex] = useState<number | null>(null)
   const [exportResult, setExportResult] = useState<any>(null)
 
-  const [windows, setWindows] = useState<Window[]>([])
-  const [newWindow, setNewWindow] = useState<Window>({ name: '', start: 0, end: 1 })
-
   const [windowMasks, setWindowMasks] = useState<WindowMask[]>([])
   const [newMask, setNewMask] = useState<WindowMask>({ name: '', start: 0, end: 1, mode: 'allow', source_type: 'ground_contact', source_ref: '' })
 
@@ -189,7 +183,7 @@ export default function App() {
 
   const totalDuration = useMemo(() => phasesWithOffsets.reduce((sum, p) => sum + p.duration, 0), [phasesWithOffsets])
 
-  const allowedIntervals = useMemo(() => buildAllowedIntervals(totalDuration, windows, windowMasks), [totalDuration, windows, windowMasks])
+  const allowedIntervals = useMemo(() => buildAllowedIntervals(totalDuration, windowMasks), [totalDuration, windowMasks])
   const denyIntervals = useMemo(() => windowMasks.filter(m => m.mode === 'deny').map(m => ({ start: m.start, end: m.end })), [windowMasks])
 
   const addPhase = () => {
@@ -233,6 +227,7 @@ export default function App() {
     const data = await res.json()
     if (!data.data) return
     const d = data.data
+    localStorage.setItem('conops_last_project_id', String(id))
     setIntent(d.intent)
     setStakeholders(d.stakeholders)
     setTemplate(d.template)
@@ -242,7 +237,6 @@ export default function App() {
     setMaxPower(d.max_power_w)
     setDownlink(d.downlink_gb_per_day)
     setPhases(d.phases.map((p: any) => ({ name: p.name, duration: p.duration || 1 })))
-    setWindows(d.windows || [])
     setWindowMasks((d.window_masks || []).map((m: any) => ({
       name: m.name,
       start: m.start,
@@ -257,6 +251,19 @@ export default function App() {
     setActivities((d.activities || []).map((a: any, idx: number) => ({ id: a.id || `${idx}-${a.name}`, name: a.name, start: a.start, duration: a.duration || 1, row: a.row || 0 })))
   }
 
+  useEffect(() => {
+    const init = async () => {
+      const res = await fetch(`${API_BASE}/projects`)
+      const list = await res.json()
+      setProjects(list)
+      const last = localStorage.getItem('conops_last_project_id')
+      if (last && list.some((p: any) => String(p.id) === String(last))) {
+        await loadProject(parseInt(last, 10))
+      }
+    }
+    init()
+  }, [])
+
   const buildPayload = () => ({
     intent,
     stakeholders,
@@ -267,7 +274,6 @@ export default function App() {
     max_power_w: maxPower,
     downlink_gb_per_day: downlink,
     phases: phases.map((p, i) => ({ name: p.name, order: i, duration: p.duration })),
-    windows,
     window_masks: windowMasks,
     activities: activities.map(a => ({ name: a.name, start: a.start, duration: a.duration, row: a.row })),
     requirement_rules: requirementRules,
@@ -395,6 +401,21 @@ export default function App() {
   return (
     <Container maxWidth="lg" sx={{ py: 4 }}>
       <Typography variant="h4" gutterBottom>ConOps Builder v2</Typography>
+
+      <Paper sx={{ p: 2, mb: 3 }}>
+        <Typography variant="h6">Project Storage</Typography>
+        <Stack direction="row" spacing={2} sx={{ mt: 1 }}>
+          <TextField label="Project name" value={projectName} onChange={e => setProjectName(e.target.value)} />
+          <Button variant="outlined" onClick={saveProject}>Save Project</Button>
+          <Button variant="outlined" onClick={fetchProjects}>Refresh List</Button>
+        </Stack>
+        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap', rowGap: 1 }}>
+          {projects.map(p => (
+            <Button key={p.id} onClick={() => loadProject(p.id)} variant="text">Load: {p.name}</Button>
+          ))}
+        </Stack>
+      </Paper>
+
       <Paper sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Intent + Stakeholders</Typography>
         <TextField fullWidth label="Mission intent" sx={{ mt: 1 }} value={intent} onChange={e => setIntent(e.target.value)} />
@@ -436,36 +457,18 @@ export default function App() {
         </TextField>
       </Paper>
 
-      <Paper sx={{ p: 2, mb: 3 }}>
-        <Typography variant="h6">Legacy Windows (Compatibility)</Typography>
-        <Typography variant="caption" color="text.secondary">Optional. Used only when no allow masks exist.</Typography>
-        <Stack direction="row" spacing={2} sx={{ mt: 1 }}>
-          <TextField label="Name" value={newWindow.name} onChange={e => setNewWindow({ ...newWindow, name: e.target.value })} />
-          <TextField type="number" label="Start" value={newWindow.start} onChange={e => setNewWindow({ ...newWindow, start: parseFloat(e.target.value) })} />
-          <TextField type="number" label="End" value={newWindow.end} onChange={e => setNewWindow({ ...newWindow, end: parseFloat(e.target.value) })} />
-          <Button variant="outlined" onClick={() => {
-            if (!newWindow.name) return
-            setWindows([...windows, newWindow])
-            setNewWindow({ name: '', start: 0, end: 1 })
-          }}>Add Legacy Window</Button>
-        </Stack>
-        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap' }}>
-          {windows.map((w, i) => (
-            <Chip key={i} label={`${w.name} (${w.start}-${w.end})`} onDelete={() => setWindows(windows.filter((_, j) => j !== i))} />
-          ))}
-        </Stack>
-      </Paper>
+      <></>
 
       <Paper sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Window Masks (Primary)</Typography>
-        <Typography variant="caption" color="text.secondary">Declarative allow/forbid masks with source types. TradeSpaceKit computes real windows per design point.</Typography>
+        <Typography variant="caption" color="text.secondary">Use masks as policy constraints on the timeline axis. Start/End are timeline coordinates (same x-axis as activities), not calendar dates. Recurring sources (like ground contact) should be entered as multiple masks for now.</Typography>
         <Stack direction="row" spacing={2} sx={{ mt: 1, flexWrap: 'wrap' }}>
           <TextField label="Name" value={newMask.name} onChange={e => setNewMask({ ...newMask, name: e.target.value })} />
           <TextField select label="Mode" value={newMask.mode} onChange={e => setNewMask({ ...newMask, mode: e.target.value as WindowMask['mode'] })}>
             <MenuItem value="allow">allow</MenuItem>
             <MenuItem value="deny">deny</MenuItem>
           </TextField>
-          <TextField select label="Source Type" value={newMask.source_type} onChange={e => setNewMask({ ...newMask, source_type: e.target.value })}>
+          <TextField select label="Window rule source" value={newMask.source_type} onChange={e => setNewMask({ ...newMask, source_type: e.target.value })}>
             <MenuItem value="ground_contact">ground_contact</MenuItem>
             <MenuItem value="imaging_window">imaging_window</MenuItem>
             <MenuItem value="approach_window">approach_window</MenuItem>
@@ -475,16 +478,16 @@ export default function App() {
             <MenuItem value="star_tracker_blinding">star_tracker_blinding</MenuItem>
             <MenuItem value="keep_out_geometry">keep_out_geometry</MenuItem>
           </TextField>
-          <TextField label="Source Ref" value={newMask.source_ref || ''} onChange={e => setNewMask({ ...newMask, source_ref: e.target.value })} />
-          <TextField type="number" label="Start" value={newMask.start} onChange={e => setNewMask({ ...newMask, start: parseFloat(e.target.value) })} />
-          <TextField type="number" label="End" value={newMask.end} onChange={e => setNewMask({ ...newMask, end: parseFloat(e.target.value) })} />
+          <TextField label="Reference (optional)" value={newMask.source_ref || ''} onChange={e => setNewMask({ ...newMask, source_ref: e.target.value })} />
+          <TextField type="number" label="Timeline start (t)" value={newMask.start} onChange={e => setNewMask({ ...newMask, start: parseFloat(e.target.value) })} />
+          <TextField type="number" label="Timeline end (t)" value={newMask.end} onChange={e => setNewMask({ ...newMask, end: parseFloat(e.target.value) })} />
           <Button variant="outlined" onClick={() => {
             if (!newMask.name) return
             setWindowMasks([...windowMasks, newMask])
             setNewMask({ name: '', start: 0, end: 1, mode: 'allow', source_type: 'ground_contact', source_ref: '' })
           }}>Add Mask</Button>
         </Stack>
-        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap' }}>
+        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap', rowGap: 1, columnGap: 1 }}>
           {windowMasks.map((w, i) => (
             <Chip key={i} color={w.mode === 'deny' ? 'warning' : 'success'} label={`${w.name} (${w.mode} ${w.start}-${w.end}, ${w.source_type})`} onDelete={() => setWindowMasks(windowMasks.filter((_, j) => j !== i))} />
           ))}
@@ -493,6 +496,7 @@ export default function App() {
 
       <Paper sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Activity Gating Rules (Operational Contract)</Typography>
+        <Typography variant="caption" color="text.secondary">Activity type is semantic (capture/imaging/downlink). It is independent from visual row lanes.</Typography>
         <Stack direction="row" spacing={2} sx={{ mt: 1, flexWrap: 'wrap' }}>
           <TextField label="Activity Type" value={newRule.activity_type} onChange={e => setNewRule({ ...newRule, activity_type: e.target.value })} />
           <TextField select label="Rule" value={newRule.rule} onChange={e => setNewRule({ ...newRule, rule: e.target.value })}>
@@ -507,7 +511,7 @@ export default function App() {
             setNewRule({ activity_type: 'capture', rule: 'requires_contact_or_blackout_leq', threshold: '120s' })
           }}>Add Rule</Button>
         </Stack>
-        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap' }}>
+        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap', rowGap: 1, columnGap: 1 }}>
           {requirementRules.map((r, i) => (
             <Chip key={i} label={`${r.activity_type}: ${r.rule}${r.threshold ? ` (${r.threshold})` : ''}`} onDelete={() => setRequirementRules(requirementRules.filter((_, j) => j !== i))} />
           ))}
@@ -528,7 +532,7 @@ export default function App() {
             setNewOverride({ phase: '', autonomy_level: 3, comms_policy: '' })
           }}>Add Override</Button>
         </Stack>
-        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap' }}>
+        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap', rowGap: 1, columnGap: 1 }}>
           {phaseOverrides.map((o, i) => (
             <Chip key={i} label={`${o.phase}: autonomy=${o.autonomy_level ?? '-'}, comms=${o.comms_policy || '-'}`} onDelete={() => setPhaseOverrides(phaseOverrides.filter((_, j) => j !== i))} />
           ))}
@@ -685,19 +689,9 @@ export default function App() {
         )}
       </Paper>
 
-      <Paper sx={{ p: 2, mb: 3 }}>
-        <Typography variant="h6">Project Storage</Typography>
-        <Stack direction="row" spacing={2} sx={{ mt: 1 }}>
-          <TextField label="Project name" value={projectName} onChange={e => setProjectName(e.target.value)} />
-          <Button variant="outlined" onClick={saveProject}>Save Project</Button>
-          <Button variant="outlined" onClick={fetchProjects}>Refresh List</Button>
-        </Stack>
-        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap' }}>
-          {projects.map(p => (
-            <Button key={p.id} onClick={() => loadProject(p.id)} variant="text">Load: {p.name}</Button>
-          ))}
-        </Stack>
-      </Paper>
+      <></>
+
+
 
       <Paper sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Policies + Constraints</Typography>
