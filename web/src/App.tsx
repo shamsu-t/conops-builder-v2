@@ -15,6 +15,13 @@ const CONSTRAINT_CARDS = [
   'Approach keep-out gate'
 ]
 
+const CARD_META: Record<string, { trace: string }> = {
+  'Capture safety gate': { trace: 'need.capture_safety -> req.contact_or_blackout' },
+  'Storm blackout tolerance': { trace: 'need.storm_ops -> req.blackout_tolerance' },
+  'Imaging eclipse gate': { trace: 'need.image_quality -> req.no_eclipse_imaging' },
+  'Approach keep-out gate': { trace: 'need.proximity_safety -> req.koz_avoidance' }
+}
+
 const WIZARD_STEPS = [
   { id: 'step-intent', title: '1) Intent & stakeholders' },
   { id: 'step-phases', title: '2) Phases & timeline' },
@@ -453,6 +460,33 @@ export default function App() {
     return msgs
   }, [manualBlocks, activities, allowedIntervals, denyIntervals, sourceRules, requirementRules])
 
+
+  const cardDiagnostics = useMemo(() => {
+    const hasSource = (type: string, mode?: 'allow'|'deny') => sourceRules.some(s => s.source_type === type && (!mode || s.mode === mode))
+    const hasRule = (activity: string, rule: string) => requirementRules.some(r => r.activity_type === activity && r.rule === rule)
+    const out: Record<string, string[]> = {}
+    CONSTRAINT_CARDS.forEach(card => {
+      const msgs: string[] = []
+      if (card === 'Capture safety gate') {
+        if (!hasSource('ground_contact', 'allow')) msgs.push('Missing allow source: ground_contact')
+        if (!hasRule('capture', 'requires_contact_or_blackout_leq')) msgs.push('Missing rule: capture requires_contact_or_blackout_leq')
+      }
+      if (card === 'Storm blackout tolerance') {
+        if (!hasSource('comms_blackout', 'deny')) msgs.push('Missing deny source: comms_blackout')
+        if (!hasRule('capture', 'requires_contact_or_blackout_leq')) msgs.push('Missing rule: capture requires_contact_or_blackout_leq')
+      }
+      if (card === 'Imaging eclipse gate') {
+        if (!hasSource('eclipse', 'deny')) msgs.push('Missing deny source: eclipse')
+        if (!hasRule('imaging', 'forbid_during_eclipse')) msgs.push('Missing rule: imaging forbid_during_eclipse')
+      }
+      if (card === 'Approach keep-out gate') {
+        if (!hasSource('keep_out_geometry', 'deny')) msgs.push('Missing deny source: keep_out_geometry')
+        if (!hasRule('maneuver', 'requires_contact')) msgs.push('Missing rule: maneuver requires_contact')
+      }
+      out[card] = msgs
+    })
+    return out
+  }, [sourceRules, requirementRules])
   return (
     <Container maxWidth="lg" sx={{ py: 4 }}>
       <Typography variant="h4" gutterBottom>ConOps Builder v2</Typography>
@@ -796,6 +830,22 @@ export default function App() {
             </Button>
           ))}
         </Stack>
+        <Box sx={{ mt: 2 }}>
+          {CONSTRAINT_CARDS.map(card => {
+            const issues = cardDiagnostics[card] || []
+            return (
+              <Box key={`diag-${card}`} sx={{ mb: 1, p: 1, border: '1px solid #e5e7eb', borderRadius: 1 }}>
+                <Typography variant="subtitle2">{card}</Typography>
+                <Typography variant="caption" color="text.secondary">Trace: {CARD_META[card]?.trace}</Typography>
+                {issues.length === 0 ? (
+                  <Typography variant="body2" color="success.main">Ready</Typography>
+                ) : (
+                  issues.map((m, i) => <Typography key={i} variant="body2" color="warning.main">• {m}</Typography>)
+                )}
+              </Box>
+            )
+          })}
+        </Box>
       </Paper>
 
       <Paper sx={{ p: 2, mb: 3 }}>
