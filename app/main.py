@@ -71,6 +71,11 @@ class RequirementRule(BaseModel):
     rule: str
     threshold: str = ''
 
+class PhasePolicyOverride(BaseModel):
+    phase: str
+    autonomy_level: Optional[int] = None
+    comms_policy: Optional[str] = None
+
 class ConOpsInput(BaseModel):
     intent: str
     stakeholders: str
@@ -79,6 +84,7 @@ class ConOpsInput(BaseModel):
     window_masks: List[WindowMask] = []
     activities: List[Activity] = []
     requirement_rules: List[RequirementRule] = []
+    phase_policy_overrides: List[PhasePolicyOverride] = []
     timeline_rows: List[str] = []
     template: str = 'base'
     autonomy_level: int = 2
@@ -129,6 +135,7 @@ def build_patch(spec: ConOpsInput):
             "phase_policies": {
                 "autonomy_level": spec.autonomy_level,
                 "comms_policy": spec.comms_policy,
+                "overrides": [o.model_dump() for o in spec.phase_policy_overrides],
             },
             "window_sources": [w.model_dump() for w in spec.window_masks],
             "activity_gating_rules": [r.model_dump() for r in spec.requirement_rules],

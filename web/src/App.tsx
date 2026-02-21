@@ -16,6 +16,7 @@ type WindowMask = { name: string; start: number; end: number; mode: 'allow' | 'd
 
 type Activity = { id: string; name: string; start: number; duration: number; row: number }
 type RequirementRule = { activity_type: string; rule: string; threshold?: string }
+type PhasePolicyOverride = { phase: string; autonomy_level?: number; comms_policy?: string }
 
 type Interval = { start: number; end: number }
 
@@ -159,6 +160,8 @@ export default function App() {
 
   const [requirementRules, setRequirementRules] = useState<RequirementRule[]>([])
   const [newRule, setNewRule] = useState<RequirementRule>({ activity_type: 'capture', rule: 'requires_contact_or_blackout_leq', threshold: '120s' })
+  const [phaseOverrides, setPhaseOverrides] = useState<PhasePolicyOverride[]>([])
+  const [newOverride, setNewOverride] = useState<PhasePolicyOverride>({ phase: '', autonomy_level: 3, comms_policy: '' })
 
   const [rows, setRows] = useState<string[]>(['Row A', 'Row B', 'Row C'])
   const [newRow, setNewRow] = useState('')
@@ -249,6 +252,7 @@ export default function App() {
       source_ref: m.source_ref || ''
     })))
     setRequirementRules(d.requirement_rules || [])
+    setPhaseOverrides(d.phase_policy_overrides || [])
     setRows(d.timeline_rows && d.timeline_rows.length > 0 ? d.timeline_rows : ['Row A', 'Row B', 'Row C'])
     setActivities((d.activities || []).map((a: any, idx: number) => ({ id: a.id || `${idx}-${a.name}`, name: a.name, start: a.start, duration: a.duration || 1, row: a.row || 0 })))
   }
@@ -267,6 +271,7 @@ export default function App() {
     window_masks: windowMasks,
     activities: activities.map(a => ({ name: a.name, start: a.start, duration: a.duration, row: a.row })),
     requirement_rules: requirementRules,
+    phase_policy_overrides: phaseOverrides,
     timeline_rows: rows
   })
 
@@ -296,6 +301,15 @@ export default function App() {
     if (!newRow.trim()) return
     setRows([...rows, newRow.trim()])
     setNewRow('')
+  }
+
+  const removeRow = (idx: number) => {
+    if (rows.length <= 1) return
+    setRows(prev => prev.filter((_, i) => i !== idx))
+    setActivities(prev => prev
+      .filter(a => a.row !== idx)
+      .map(a => ({ ...a, row: a.row > idx ? a.row - 1 : a.row })))
+    setNewActivity(prev => ({ ...prev, row: Math.max(0, Math.min(prev.row, rows.length - 2)) }))
   }
 
   const addActivity = () => {
@@ -359,6 +373,25 @@ export default function App() {
   const selectedActivity = activities.find(a => a.id === selectedActivityId) || null
   const selectedExplain = selectedActivity ? explainPlacement(selectedActivity, allowedIntervals, denyIntervals, windowMasks, requirementRules) : null
 
+  const conflicts = useMemo(() => {
+    const msgs: string[] = []
+    windowMasks.forEach((a, i) => {
+      if (a.end <= a.start) msgs.push(`Mask '${a.name}' has end <= start`)
+      for (let j = i + 1; j < windowMasks.length; j++) {
+        const b = windowMasks[j]
+        const overlap = !(a.end <= b.start || a.start >= b.end)
+        if (overlap && a.mode !== b.mode && a.source_type === b.source_type) {
+          msgs.push(`Conflicting masks overlap: '${a.name}' vs '${b.name}' (${a.source_type})`)
+        }
+      }
+    })
+    activities.forEach(act => {
+      const ex = explainPlacement(act, allowedIntervals, denyIntervals, windowMasks, requirementRules)
+      if (!ex.ok) msgs.push(`${act.name}: ${ex.messages.join('; ')}`)
+    })
+    return msgs
+  }, [windowMasks, activities, allowedIntervals, denyIntervals, requirementRules])
+
   return (
     <Container maxWidth="lg" sx={{ py: 4 }}>
       <Typography variant="h4" gutterBottom>ConOps Builder v2</Typography>
@@ -389,7 +422,7 @@ export default function App() {
         <Box sx={{ display: 'flex', gap: 1, mt: 1, alignItems: 'stretch', border: '1px solid #ddd', p: 1 }}>
           {phases.map((p, i) => (
             <Box key={i} sx={{ flex: p.duration, minWidth: 60, p: 1, bgcolor: '#e3f2fd', border: '1px solid #90caf9', textAlign: 'center' }}>
-              <Typography variant="caption" display="block">{p.name}</Typography>
+              <Typography variant="caption" display="block" noWrap title={p.name} sx={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</Typography>
               <TextField size="small" type="number" label="Dur" value={p.duration} onChange={e => setPhaseDuration(i, parseFloat(e.target.value) || 1)} />
             </Box>
           ))}
@@ -482,10 +515,37 @@ export default function App() {
       </Paper>
 
       <Paper sx={{ p: 2, mb: 3 }}>
+        <Typography variant="h6">Phase-specific Policy Overrides</Typography>
+        <Stack direction="row" spacing={2} sx={{ mt: 1, flexWrap: 'wrap' }}>
+          <TextField select label="Phase" value={newOverride.phase || ''} onChange={e => setNewOverride({ ...newOverride, phase: e.target.value })}>
+            {phases.map((p, idx) => (<MenuItem key={`${p.name}-${idx}`} value={p.name}>{p.name}</MenuItem>))}
+          </TextField>
+          <TextField type="number" label="Autonomy level" value={newOverride.autonomy_level ?? ''} onChange={e => setNewOverride({ ...newOverride, autonomy_level: parseInt(e.target.value) })} />
+          <TextField label="Comms policy" value={newOverride.comms_policy || ''} onChange={e => setNewOverride({ ...newOverride, comms_policy: e.target.value })} />
+          <Button variant="outlined" onClick={() => {
+            if (!newOverride.phase) return
+            setPhaseOverrides([...phaseOverrides, newOverride])
+            setNewOverride({ phase: '', autonomy_level: 3, comms_policy: '' })
+          }}>Add Override</Button>
+        </Stack>
+        <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap' }}>
+          {phaseOverrides.map((o, i) => (
+            <Chip key={i} label={`${o.phase}: autonomy=${o.autonomy_level ?? '-'}, comms=${o.comms_policy || '-'}`} onDelete={() => setPhaseOverrides(phaseOverrides.filter((_, j) => j !== i))} />
+          ))}
+        </Stack>
+      </Paper>
+
+      <Paper sx={{ p: 2, mb: 3 }}>
         <Typography variant="h6">Activity Timeline (Multi-row)</Typography>
+        <Typography variant="caption" color="text.secondary">Rows are activity lanes (e.g., Sensing, Comms, Actuation). Add/remove lanes as needed.</Typography>
         <Stack direction="row" spacing={2} sx={{ mt: 1 }}>
           <TextField label="Row name" value={newRow} onChange={e => setNewRow(e.target.value)} />
           <Button variant="outlined" onClick={addRow}>Add Row</Button>
+        </Stack>
+        <Stack direction="row" spacing={1} sx={{ mt: 1, flexWrap: 'wrap' }}>
+          {rows.map((r, idx) => (
+            <Chip key={`${r}-${idx}`} label={r} onDelete={() => removeRow(idx)} />
+          ))}
         </Stack>
         <Stack direction="row" spacing={2} sx={{ mt: 2 }}>
           <TextField label="Activity" value={newActivity.name} onChange={e => setNewActivity({ ...newActivity, name: e.target.value })} />
@@ -503,7 +563,7 @@ export default function App() {
           <Box sx={{ display: 'flex', borderBottom: '1px solid #eee' }}>
             {phasesWithOffsets.map((p, i) => (
               <Box key={i} sx={{ flex: p.duration, p: 1, textAlign: 'center', bgcolor: '#fafafa', borderRight: '1px solid #eee' }}>
-                <Typography variant="caption">{p.name}</Typography>
+                <Typography variant="caption" noWrap title={p.name} sx={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</Typography>
               </Box>
             ))}
           </Box>
@@ -511,7 +571,7 @@ export default function App() {
             const rowKey = `${rowIndex}`
             const rowActivities = activities.filter(a => a.row === rowIndex)
             return (
-              <Box key={row} sx={{ position: 'relative', borderBottom: '1px solid #eee', minHeight: 56 }}>
+              <Box key={`${row}-${rowIndex}`} sx={{ position: 'relative', borderBottom: '1px solid #eee', minHeight: 56 }}>
                 <Box sx={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 140, borderRight: '1px solid #eee', p: 1, bgcolor: '#fafafa' }}>
                   <Typography variant="caption">{row}</Typography>
                 </Box>
@@ -556,10 +616,15 @@ export default function App() {
                           alignItems: 'center',
                           justifyContent: 'center',
                           cursor: 'grab',
-                          userSelect: 'none'
+                          userSelect: 'none',
+                          overflow: 'hidden',
+                          px: 0.5
                         }}
+                        title={`${activity.name} (${activity.start.toFixed(2)}-${(activity.start + activity.duration).toFixed(2)})`}
                       >
-                        <Typography variant="caption">{activity.name}</Typography>
+                        <Typography variant="caption" noWrap sx={{ overflow: 'hidden', textOverflow: 'ellipsis', lineHeight: 1.1 }}>
+                          {width < 6 ? '•' : activity.name}
+                        </Typography>
                       </Box>
                     )
                   })}
@@ -604,6 +669,19 @@ export default function App() {
           </Box>
         ) : (
           <Typography variant="body2" color="text.secondary">Select an activity to see placement details.</Typography>
+        )}
+      </Paper>
+
+      <Paper sx={{ p: 2, mb: 3 }}>
+        <Typography variant="h6">Conflict Checker</Typography>
+        {conflicts.length === 0 ? (
+          <Typography variant="body2" color="success.main">No obvious contradictions detected.</Typography>
+        ) : (
+          <Box>
+            {conflicts.slice(0, 20).map((c, i) => (
+              <Typography key={i} variant="body2" color="warning.main">• {c}</Typography>
+            ))}
+          </Box>
         )}
       </Paper>
 
