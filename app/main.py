@@ -16,6 +16,8 @@ DB_PATH = DATA / 'conops.db'
 EXPORTS = DATA / 'exports'
 EXPORTS.mkdir(exist_ok=True)
 BASE_SPEC = Path('/home/shamsu/.openclaw/workspace/trade-space-kit/configs/mission.yaml')
+WORKSPACE_PROJECTS = Path('/home/shamsu/.openclaw/workspace/projects')
+WORKSPACE_PROJECTS.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title='ConOps Builder v2')
 
@@ -89,6 +91,7 @@ class ManualTimeBlock(BaseModel):
 
 class Activity(BaseModel):
     name: str
+    activity_type: str = ''
     start: float
     duration: float = Field(default=1, gt=0)
     row: int = 0
@@ -106,6 +109,7 @@ class PhasePolicyOverride(BaseModel):
 class ConOpsInput(BaseModel):
     intent: str
     stakeholders: str
+    stakeholder_needs_summary: str = ''
     phases: List[Phase]
     windows: List[Window] = []
     window_masks: List[WindowMask] = []  # legacy payload compatibility
@@ -136,6 +140,37 @@ def deep_merge(base, patch):
             out[k] = deep_merge(out.get(k), v)
         return out
     return patch if patch is not None else base
+
+
+def conops_from_tradespace(ts: dict, fallback: dict | None = None):
+    fallback = fallback or {}
+    mission = (ts or {}).get('mission', {}) or {}
+    constraints = mission.get('constraints', {}) or {}
+    ops = (ts or {}).get('ops_timeline', {}) or {}
+    contract = (ts or {}).get('operational_contract', {}) or {}
+    phase_policies = (contract.get('phase_policies', {}) or {})
+
+    out = {
+        'intent': mission.get('intent', fallback.get('intent', 'earth_observation')),
+        'stakeholders': contract.get('stakeholders', fallback.get('stakeholders', '')),
+        'stakeholder_needs_summary': contract.get('stakeholder_needs_summary', fallback.get('stakeholder_needs_summary', '')),
+        'phases': ops.get('phases') or fallback.get('phases') or [{'name': 'Routine Operations', 'order': 0, 'duration': 30.0}],
+        'windows': fallback.get('windows', []),
+        'window_masks': fallback.get('window_masks', []),
+        'source_rules': contract.get('window_sources') or fallback.get('source_rules') or [],
+        'manual_time_blocks': ops.get('manual_time_blocks') or fallback.get('manual_time_blocks') or [],
+        'activities': ops.get('activities') or fallback.get('activities') or [],
+        'requirement_rules': contract.get('activity_gating_rules') or fallback.get('requirement_rules') or [],
+        'phase_policy_overrides': phase_policies.get('overrides') or fallback.get('phase_policy_overrides') or [],
+        'timeline_rows': ops.get('timeline_rows') or fallback.get('timeline_rows') or [],
+        'template': ((ts or {}).get('study', {}) or {}).get('profile', fallback.get('template', 'base')),
+        'autonomy_level': phase_policies.get('autonomy_level', constraints.get('autonomy_level', fallback.get('autonomy_level', 2))),
+        'comms_policy': phase_policies.get('comms_policy', fallback.get('comms_policy', 'store-and-forward')),
+        'max_mass_kg': constraints.get('max_mass_kg', fallback.get('max_mass_kg', 200)),
+        'max_power_w': constraints.get('max_power_w', fallback.get('max_power_w', 500)),
+        'downlink_gb_per_day': constraints.get('downlink_gb_per_day', fallback.get('downlink_gb_per_day', 5)),
+    }
+    return out
 
 
 def build_patch(spec: ConOpsInput):
@@ -170,6 +205,7 @@ def build_patch(spec: ConOpsInput):
         "operational_contract": {
             "intent": spec.intent,
             "stakeholders": spec.stakeholders,
+            "stakeholder_needs_summary": spec.stakeholder_needs_summary,
             "objectives": {"profile": spec.template},
             "phase_policies": {
                 "autonomy_level": spec.autonomy_level,
@@ -213,17 +249,31 @@ def health():
 def save_project(name: str, spec: ConOpsInput):
     data = spec.model_dump()
     with Session(engine) as s:
+        rows = s.exec(select(ConOpsProject)).all()
+        same = [r for r in rows if r.name == name]
+        if same:
+            # keep newest, update it, remove stale duplicates
+            same.sort(key=lambda r: (r.created_at, r.id or 0), reverse=True)
+            obj = same[0]
+            obj.data = json.dumps(data)
+            obj.created_at = datetime.utcnow()
+            s.add(obj)
+            for stale in same[1:]:
+                s.delete(stale)
+            s.commit()
+            s.refresh(obj)
+            return {"id": obj.id, "updated": True, "deduped": len(same)-1}
         obj = ConOpsProject(name=name, data=json.dumps(data))
         s.add(obj)
         s.commit()
         s.refresh(obj)
-    return {"id": obj.id}
+    return {"id": obj.id, "updated": False, "deduped": 0}
 
 
 @app.get('/projects')
 def list_projects():
     with Session(engine) as s:
-        rows = s.exec(select(ConOpsProject)).all()
+        rows = s.exec(select(ConOpsProject).order_by(ConOpsProject.created_at.desc())).all()
     return [{"id": r.id, "name": r.name, "created_at": r.created_at} for r in rows]
 
 
@@ -244,6 +294,77 @@ def download(name: str):
     if not path.exists():
         return {"error": "not found"}
     return FileResponse(path)
+@app.get('/workspace/projects')
+def workspace_projects():
+    out = []
+    for d in sorted([p for p in WORKSPACE_PROJECTS.iterdir() if p.is_dir()]):
+        meta = d / 'project.yaml'
+        updated = None
+        if meta.exists():
+            try:
+                m = yaml.safe_load(meta.read_text()) or {}
+                updated = m.get('updated_at')
+            except Exception:
+                pass
+        conops = d / 'conops.yaml'
+        tradespace = d / 'tradespace.yaml'
+        sync = 'unknown'
+        if conops.exists() and tradespace.exists():
+            dc = conops.stat().st_mtime
+            dt = tradespace.stat().st_mtime
+            if abs(dc - dt) < 1:
+                sync = 'in-sync'
+            elif dc > dt:
+                sync = 'conops-newer'
+            else:
+                sync = 'tradespace-newer'
+        out.append({'name': d.name, 'path': str(d), 'updated_at': updated, 'sync': sync})
+    return out
+
+
+@app.post('/workspace/save')
+def workspace_save(name: str, spec: ConOpsInput):
+    pdir = WORKSPACE_PROJECTS / name
+    pdir.mkdir(parents=True, exist_ok=True)
+    conops_doc = spec.model_dump()
+    tradespace_doc = build_full_spec(spec)
+    (pdir / 'conops.yaml').write_text(yaml.safe_dump(conops_doc, sort_keys=False))
+    (pdir / 'tradespace.yaml').write_text(yaml.safe_dump(tradespace_doc, sort_keys=False))
+    meta = {
+        'name': name,
+        'updated_at': datetime.utcnow().isoformat(),
+        'files': {
+            'conops': 'conops.yaml',
+            'tradespace': 'tradespace.yaml'
+        }
+    }
+    (pdir / 'project.yaml').write_text(yaml.safe_dump(meta, sort_keys=False))
+    return {'ok': True, 'project': name, 'path': str(pdir)}
+
+
+@app.get('/workspace/load/{name}')
+def workspace_load(name: str):
+    pdir = WORKSPACE_PROJECTS / name
+    if not pdir.exists():
+        return {'error': 'not found'}
+    conops_path = pdir / 'conops.yaml'
+    tradespace_path = pdir / 'tradespace.yaml'
+    out = {'name': name, 'path': str(pdir), 'tradespace_path': str(tradespace_path)}
+
+    conops_doc = yaml.safe_load(conops_path.read_text()) if conops_path.exists() else {}
+    tradespace_doc = yaml.safe_load(tradespace_path.read_text()) if tradespace_path.exists() else {}
+
+    # Authoritative load for trade-sync flow: if tradespace exists, hydrate ConOps UI from it.
+    if isinstance(tradespace_doc, dict) and tradespace_doc:
+        out['conops'] = conops_from_tradespace(tradespace_doc, conops_doc if isinstance(conops_doc, dict) else {})
+        out['source'] = 'tradespace'
+    elif isinstance(conops_doc, dict) and conops_doc:
+        out['conops'] = conops_doc
+        out['source'] = 'conops'
+
+    return out
+
+
 @app.post('/export')
 def export_spec(spec: ConOpsInput):
     ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
@@ -258,6 +379,7 @@ def export_spec(spec: ConOpsInput):
         f"# ConOps Summary\n\n"
         f"**Intent:** {spec.intent}\n\n"
         f"**Stakeholders:** {spec.stakeholders}\n\n"
+        f"**Stakeholder needs summary:** {spec.stakeholder_needs_summary}\n\n"
         f"**Template:** {spec.template}\n\n"
         f"**Policies:**\n- Autonomy level: {spec.autonomy_level}\n- Comms policy: {spec.comms_policy}\n\n"
         f"**Constraints:**\n- Max mass: {spec.max_mass_kg} kg\n- Max power: {spec.max_power_w} W\n- Downlink: {spec.downlink_gb_per_day} GB/day\n\n"
